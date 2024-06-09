@@ -102,6 +102,13 @@
 # include <sys/wait.h>		/* for WNOHANG on BSD */
 #endif
 
+#ifdef HAVE_SYS_CLONEFILE_H
+# include <sys/clonefile.h>
+# ifndef CLONE_NOOWNERCOPY
+#  define CLONE_NOOWNERCOPY 2
+# endif
+#endif
+
 #ifdef HAVE_COPYFILE_H
 # include <copyfile.h>
 #endif
@@ -12537,6 +12544,65 @@ nogvl_copy_stream_wait_write(struct copy_stream_struct *stp)
     return 0;
 }
 
+#ifdef HAVE_FCLONEFILEAT
+static void *
+nogvl_fclonefileat(void *arg)
+{
+    struct copy_stream_struct *stp = (struct copy_stream_struct *)arg;
+    const char *dst = StringValueCStr(stp->dst);
+    mode_t mask;
+    int ret;
+
+    if (stp->copy_length >= (rb_off_t)0 || stp->src_offset > 0) {
+        /* fclonefileat(2) always clones the entire file */
+        return 0;
+    }
+
+    if (!S_ISREG(stp->src_stat.st_mode))
+        return 0;
+
+    mask = umask(0);
+    umask(mask);
+
+    ret = fclonefileat(stp->src_fptr->fd, AT_FDCWD, dst, CLONE_NOOWNERCOPY);
+
+    if (ret == 0) { /* success */
+        /* fclonefileat(2) copies permissions and mtime, but we want to reset them to be like a new file */
+        ret = chmod(dst, 0666 & ~mask);
+        if (ret != 0) {
+            stp->syserr = "chmod";
+            stp->error_no = errno;
+            unlink(dst);
+            return (void *)(VALUE)ret;
+        }
+        ret = utimes(dst, NULL);
+        if (ret != 0) {
+            stp->syserr = "utimes";
+            stp->error_no = errno;
+            unlink(dst);
+            return (void *)(VALUE)ret;
+        }
+
+        /* fclonefileat(2) doesn't return the size copied, but also doesn't support partial copies */
+        stp->total = stp->src_stat.st_size;
+    }
+    else {
+        switch (errno) {
+          case ENOSYS:
+          case ENOTSUP:
+          case EXDEV:
+          case EINVAL: /* CLONE_NOOWNERCOPY isn't supported on 10.12 */
+          case EEXIST: /* fclonefileat(2) cannot overwrite files */
+            return 0;
+        }
+        stp->syserr = "fclonefileat";
+        stp->error_no = errno;
+        return (void *)(VALUE)ret;
+    }
+    return (void *)1;
+}
+#endif
+
 #ifdef USE_COPY_FILE_RANGE
 
 static ssize_t
@@ -13170,8 +13236,18 @@ copy_stream_body(VALUE arg)
             dst_io = GetWriteIO(tmp_io);
         }
         else if (!RB_TYPE_P(dst_io, T_FILE)) {
-            VALUE args[3];
             FilePathValue(dst_io);
+
+#ifdef HAVE_FCLONEFILEAT
+            if (stp->src_fptr && !stp->src_fptr->rbuf.len) {
+                stp->dst = rb_str_encode_ospath(dst_io);
+                int ret = IO_WITHOUT_GVL_INT(nogvl_fclonefileat, stp);
+                if (ret != 0)
+                    return Qnil;
+            }
+#endif
+
+            VALUE args[3];
             args[0] = dst_io;
             args[1] = INT2NUM(O_WRONLY|O_CREAT|O_TRUNC|common_oflags);
             args[2] = INT2FIX(0666);
